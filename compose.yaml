@@ -1,0 +1,76 @@
+x-database-url: &database-url postgresql+asyncpg://payments:payments@postgres:5432/payments
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "payments", "-d", "payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 25
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "127.0.0.1:${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: *database-url
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.api:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >
+          import http.client, os;
+          conn = http.client.HTTPConnection('127.0.0.1', 8000, timeout=2);
+          conn.request('GET', '/api/v1/payments/00000000-0000-0000-0000-000000000000',
+          headers={'X-API-Key': os.environ['API_KEY']});
+          assert conn.getresponse().status == 404
+      interval: 3s
+      timeout: 4s
+      retries: 20
+
+  consumer:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: *database-url
+      AMQP_URL: amqp://payments:payments@rabbitmq:5672/
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    stop_grace_period: 40s
+    restart: on-failure
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
