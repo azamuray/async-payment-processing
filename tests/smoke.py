@@ -71,31 +71,42 @@ def check_service(api, rabbit):
     assert httpx.post(API, json={}).status_code == 401
     assert api.get(f"{API}/{uuid4()}").status_code == 404
 
+    exact_amount = "1234567890123456.78"
     body = {
-        "amount": "125.50",
+        "amount": exact_amount,
         "currency": "RUB",
         "description": "Smoke test",
-        "metadata": {"test": True},
+        "metadata": {"test": True, "amount": 1.25},
         "webhook_url": f"http://{CALLBACK_HOST}/recover",
     }
-    key = {"Idempotency-Key": str(uuid4())}
+    key = {"Idempotency-Key": str(uuid4()), "Content-Type": "application/json"}
     assert api.post(API, json=body).status_code == 422
     assert api.post(API, json=body | {"amount": "1.001"}, headers=key).status_code == 422
+    numeric_body = json.dumps(body).replace(f'"{exact_amount}"', exact_amount, 1)
+    assert api.post(
+        API,
+        content=numeric_body.replace(exact_amount, "0.0100000000000000001", 1),
+        headers=key,
+    ).status_code == 422
     with ThreadPoolExecutor(max_workers=8) as pool:
-        responses = list(pool.map(lambda _: api.post(API, json=body, headers=key), range(8)))
+        responses = list(pool.map(lambda _: api.post(API, content=numeric_body, headers=key), range(8)))
     assert all(response.status_code == 202 for response in responses), [
         (response.status_code, response.text) for response in responses
     ]
     payment_ids = {response.json()["payment_id"] for response in responses}
     assert len(payment_ids) == 1
     payment_id = payment_ids.pop()
+    replay = api.post(API, json=body, headers=key)
+    assert replay.status_code == 202
+    assert replay.json()["payment_id"] == payment_id
     assert api.post(API, json=body | {"amount": "126.50"}, headers=key).status_code == 409
-    assert api.post(API, json=body | {"metadata": {"test": 1}}, headers=key).status_code == 409
+    changed_metadata = body | {"metadata": {"test": 1, "amount": 1.25}}
+    assert api.post(API, json=changed_metadata, headers=key).status_code == 409
 
     recovered = wait_for(lambda: call_history("/recover"), "webhook succeeds on third attempt")
     payment = api.get(f"{API}/{payment_id}").raise_for_status().json()
     assert payment["status"] in {"succeeded", "failed"}
-    assert payment["amount"] == "125.50"
+    assert payment["amount"] == exact_amount
     assert payment["metadata"] == body["metadata"]
     check_webhook(recovered, payment)
     event_id = recovered[0][1]["event_id"]

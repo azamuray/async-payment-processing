@@ -1,11 +1,13 @@
+import json
 import os
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Security
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, Security
+from fastapi.routing import APIRoute
 from fastapi.security import APIKeyHeader
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -35,6 +37,35 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
 
 
+class JSONNumber(float):
+    literal: str
+
+    def __new__(cls, literal: str) -> "JSONNumber":
+        value = super().__new__(cls, literal)
+        value.literal = literal
+        return value
+
+
+class PaymentRequest(Request):
+    async def json(self) -> Any:
+        body = json.loads(await self.body(), parse_float=JSONNumber)
+        if isinstance(body, dict) and isinstance(amount := body.get("amount"), JSONNumber):
+            # Pass the original token to Pydantic's Decimal validator. Other numbers
+            # remain floats so JSON metadata retains its normal types.
+            body["amount"] = amount.literal
+        return body
+
+
+class PaymentRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def handle(request: Request) -> Response:
+            return await handler(PaymentRequest(request.scope, request.receive))
+
+        return handle
+
+
 app = FastAPI(
     title="Async Payment Processing",
     lifespan=lifespan,
@@ -42,7 +73,9 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
-router = APIRouter(prefix="/api/v1/payments", dependencies=[Depends(authenticate)])
+router = APIRouter(
+    prefix="/api/v1/payments", dependencies=[Depends(authenticate)], route_class=PaymentRoute
+)
 Session = Annotated[AsyncSession, Depends(get_session)]
 IdempotencyKey = Annotated[
     str, Header(alias="Idempotency-Key", min_length=1, max_length=255, pattern=r"^[!-~]+$")
